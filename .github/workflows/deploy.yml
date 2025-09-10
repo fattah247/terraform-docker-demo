@@ -1,43 +1,29 @@
-name: Deploy Docker Compose to EC2
-
+name: Deploy Docker App to EC2
 on:
   push:
     branches: [ "main" ]
-    paths:
-      - "app/**"
-      - "docker-compose.yml"
-      - ".github/workflows/deploy.yml"
-
+permissions:
+  contents: read
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Debug repo contents (sanity check)
-        run: |
-          echo "PWD: $(pwd)"
-          echo "---- TREE ----"
-          ls -la
-          echo "---- RECURSIVE ----"
-          ls -R .
-
-      - name: Copy files to EC2 (app + compose)
+      - name: Copy app and compose to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
-          host: ${{ secrets.EC2_HOST }}        # e.g. 54.x.x.x (your Elastic IP)
+          host: ${{ secrets.EC2_HOST }}
           username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}      # your PEM private key content
-          # Explicit globs so it's never empty:
+          key: ${{ secrets.EC2_SSH_KEY }}
           source: |
-            ./app/**
-            ./docker-compose.yml
+            app/**
+            docker-compose.yml
           target: /home/ubuntu/phase2
           overwrite: true
           strip_components: 0
 
-      - name: Build & run Docker Compose on EC2
+      - name: Build and run on EC2
         uses: appleboy/ssh-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -45,33 +31,27 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -euxo pipefail
-
-            # Ensure Docker/Compose present
-            if ! command -v docker >/dev/null 2>&1; then
-              curl -fsSL https://get.docker.com | sh
-              sudo usermod -aG docker ubuntu || true
-              # compose plugin typically installed with Docker on Ubuntu 24.04
-            fi
-
-            # Ensure working dir ownership
-            sudo mkdir -p /home/ubuntu/phase2
-            sudo chown -R ubuntu:ubuntu /home/ubuntu/phase2
             cd /home/ubuntu/phase2
-
-            # Bring up new version
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y ca-certificates curl gnupg
+              sudo install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              sudo chmod a+r /etc/apt/keyrings/docker.gpg
+              . /etc/os-release
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+              sudo apt-get update
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+              sudo usermod -aG docker ubuntu || true
+              sudo systemctl enable --now docker
+            fi
             docker compose down || true
             docker compose build
             docker compose up -d
-
-            # Quick health check from the instance
-            sleep 2
-            curl -s -I http://localhost | head -n 1 || true
-
-      - name: Show running containers
-        uses: appleboy/ssh-action@v0.1.7
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+            for i in {1..15}; do
+              if curl -fsS -m 2 http://localhost/ >/dev/null; then
+                break
+              fi
+              sleep 2
+            done
+            curl -fsS http://localhost/ | head -n 1 || true
