@@ -1,40 +1,36 @@
-name: Deploy Docker Compose to EC2
-
+name: deploy
 on:
   push:
-    branches: ["main"]
-    paths:
-      - "app/**"
-      - "docker-compose.yml"
-      - ".github/workflows/deploy.yml"
+    branches: [main]
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Debug repo contents
-        run: |
-          echo "PWD: $(pwd)"
-          ls -la
-          echo "---- APP DIRECTORY ----"
-          ls -la app/ || echo "No app directory found"
+      - name: Ensure remote dir
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            mkdir -p /home/ubuntu/phase2
 
-      - name: Copy files to EC2
+      - name: Copy app and compose to EC2
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: |
-            app/
-            docker-compose.yml
-          target: /home/ubuntu/phase2
+          source: "./app/**,./docker-compose.yml"
+          target: "/home/ubuntu/phase2"
           overwrite: true
+          strip_components: 0
+          debug: true
 
-      - name: Deploy on EC2
+      - name: Build and run on EC2
         uses: appleboy/ssh-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -42,61 +38,23 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -euxo pipefail
-            
-            # Install Docker if missing
-            if ! command -v docker >/dev/null 2>&1; then
-              curl -fsSL https://get.docker.com | sh
-              sudo usermod -aG docker ubuntu
-            fi
-            
-            # Install Docker Compose if missing
             if ! docker compose version >/dev/null 2>&1; then
               sudo apt-get update
-              sudo apt-get install -y docker-compose-plugin
+              sudo apt-get install -y ca-certificates curl gnupg
+              sudo install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release; echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo apt-get update
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+              sudo usermod -aG docker ubuntu || true
+              sudo systemctl enable --now docker
             fi
-            
-            # Verify installations
-            docker --version
-            docker compose version
-            
-            # Ensure proper permissions
-            sudo chown -R ubuntu:ubuntu /home/ubuntu/phase2 || true
-            
             cd /home/ubuntu/phase2
-            
-            # Verify files are present
-            echo "Contents of phase2 directory:"
-            ls -la
-            echo "Contents of app directory:"
-            ls -la app/ || echo "No app directory found"
-            
-            # Stop, build and start containers
             docker compose down || true
             docker compose build
             docker compose up -d
-            
-            # Show container status
-            docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
-            
-            # Wait for application to start with improved health check
-            echo "Waiting for application to start..."
-            for i in {1..15}; do
-              # Check if container is running and healthy
-              if docker ps --filter "name=tf-docker-demo" --format "{{.Status}}" | grep -q "Up"; then
-                # Try to access the application
-                if curl -fsS -m 5 http://localhost:80/ >/dev/null 2>&1; then
-                  echo "Application is responding"
-                  break
-                fi
-              fi
-              echo "Waiting for application... ($i)"
-              sleep 5
+            for i in {1..20}; do
+              if curl -fsS -m 2 http://localhost/ >/dev/null; then break; fi
+              sleep 2
             done
-            
-            # Final check with detailed output
-            echo "Final application check:"
-            curl -v http://localhost:80/ || echo "Curl failed"
-            
-            # Show container logs for debugging
-            echo "Container logs:"
-            docker compose logs --tail=20
+            curl -fsS http://localhost/ | head -n 1 || true
