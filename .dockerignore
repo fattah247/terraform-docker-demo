@@ -1,0 +1,7 @@
+.git
+.github
+terraform
+_backup_tf
+*.tfstate*
+*.tfvars
+.DS_Store
