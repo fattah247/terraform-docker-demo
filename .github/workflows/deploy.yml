@@ -1,7 +1,10 @@
-name: deploy
+name: Deploy to EC2 via ECR
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
+    paths:
+      - "app/**"
+      - ".github/workflows/deploy.yml"
 
 jobs:
   deploy:
@@ -11,75 +14,108 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Configure AWS creds
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to ECR
-        id: ecr
+      - name: Login to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push image
+      - name: Build, tag, and push image to Amazon ECR
         env:
-          ECR_REPO: ${{ secrets.ECR_REPO }}  
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
+          IMAGE_TAG: latest
         run: |
-          docker build -t "$ECR_REPO:latest" ./app
-          docker push "$ECR_REPO:latest"
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-      - name: SSH pull & restart
-        uses: appleboy/ssh-action@v0.1.7
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          ECR_REPO: ${{ secrets.ECR_REPO }}
-          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION,ECR_REPO,ECR_REGISTRY
           script: |
             set -euxo pipefail
-
+            
+            # Install Docker if not present
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update
               sudo apt-get install -y ca-certificates curl gnupg
               sudo install -m 0755 -d /etc/apt/keyrings
               curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release; echo $VERSION_CODENAME) stable" \
-                | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+              sudo chmod a+r /etc/apt/keyrings/docker.gpg
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
               sudo apt-get update
               sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-              sudo usermod -aG docker ubuntu || true
-              sudo systemctl enable --now docker
+              sudo usermod -aG docker ubuntu
+              sudo systemctl enable docker
+              sudo systemctl start docker
             fi
-
+            
+            # Login to ECR using AWS CLI (install if needed)
             if ! command -v aws >/dev/null 2>&1; then
-              sudo apt-get update && sudo apt-get install -y awscli
+              sudo apt-get update
+              sudo apt-get install -y awscli
             fi
-
-            aws ecr get-login-password --region "$AWS_REGION" \
-              | sudo docker login --username AWS --password-stdin "$ECR_REGISTRY"
-
-            sudo mkdir -p /home/ubuntu/phase2
+            
+            # Configure AWS credentials on EC2
+            mkdir -p ~/.aws
+            cat > ~/.aws/credentials << EOF
+            [default]
+            aws_access_key_id = ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws_secret_access_key = ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            EOF
+            
+            cat > ~/.aws/config << EOF
+            [default]
+            region = ${{ secrets.AWS_REGION }}
+            EOF
+            
+            # Login to ECR
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}
+            
+            # Create app directory and compose file
+            mkdir -p /home/ubuntu/phase2
             cd /home/ubuntu/phase2
-
-            cat > docker-compose.yml <<EOF
+            
+            # Create docker-compose.yml
+            cat > docker-compose.yml << 'EOF'
+            version: '3.8'
             services:
               web:
-                image: ${ECR_REPO}:latest
+                image: ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPO }}:latest
                 container_name: tf-docker-demo
                 ports:
                   - "80:8080"
-                restart: always
+                restart: unless-stopped
             EOF
-
-            sudo docker compose pull
-            sudo docker compose up -d
-            sudo docker compose ps
+            
+            # Pull and run the container
+            docker compose pull
+            docker compose up -d
+            
+            # Wait for container to start
+            sleep 10
+            
+            # Check container status
+            docker ps
+            docker compose logs
+            
+            # Health check
+            for i in {1..10}; do
+              if curl -f http://localhost; then
+                echo "Application is healthy"
+                break
+              fi
+              echo "Waiting for application to start... ($i/10)"
+              sleep 5
+            done
