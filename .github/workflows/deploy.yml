@@ -40,13 +40,24 @@ jobs:
 
       - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+  
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION
+          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION,AWS_SESSION_TOKEN
           script: |
             set -euxo pipefail
+
+            # Make sure the vars really exist in this remote shell
+            export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
+            export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
+            export AWS_REGION="${AWS_REGION}"
+            if [ -n "${AWS_SESSION_TOKEN:-}" ]; then export AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN}"; fi
 
             # Ensure Docker
             if ! command -v docker >/dev/null 2>&1; then
@@ -63,15 +74,15 @@ jobs:
               sudo systemctl enable --now docker
             fi
 
-            # Login to ECR using dockerized AWS CLI (no apt install)
+            # Use dockerized AWS CLI with the forwarded envs
             REGISTRY="${{ steps.login-ecr.outputs.registry }}"
             sudo docker run --rm \
-              -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \
+              -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION ${AWS_SESSION_TOKEN:+-e AWS_SESSION_TOKEN} \
               amazon/aws-cli \
               ecr get-login-password --region "$AWS_REGION" \
               | sudo docker login --username AWS --password-stdin "$REGISTRY"
 
-            # Write compose and deploy
+            # Deploy with Compose
             sudo mkdir -p /home/ubuntu/phase2
             cd /home/ubuntu/phase2
 
