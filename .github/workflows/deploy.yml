@@ -1,36 +1,35 @@
 name: deploy
 on:
   push:
-    branches: [main]
+    branches: [ "main" ]
 
 jobs:
   deploy:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure remote dir
-        uses: appleboy/ssh-action@v0.1.7
+      - name: Configure AWS creds
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            mkdir -p /home/ubuntu/phase2
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Copy app and compose to EC2
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
-          source: "./app/**,./docker-compose.yml"
-          target: "/home/ubuntu/phase2"
-          overwrite: true
-          strip_components: 0
-          debug: true
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and run on EC2
+      - name: Build and push image
+        run: |
+          ECR="${{ secrets.ECR_REPO }}"
+          docker build -t "$ECR:latest" ./app
+          docker push "$ECR:latest"
+
+      - name: SSH pull & restart
         uses: appleboy/ssh-action@v0.1.7
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -38,23 +37,21 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
             set -euxo pipefail
-            if ! docker compose version >/dev/null 2>&1; then
+            if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update
               sudo apt-get install -y ca-certificates curl gnupg
               sudo install -m 0755 -d /etc/apt/keyrings
               curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release; echo $VERSION_CODENAME) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              echo \
+                "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release; echo $VERSION_CODENAME) stable" \
+                | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
               sudo apt-get update
               sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
               sudo usermod -aG docker ubuntu || true
               sudo systemctl enable --now docker
             fi
             cd /home/ubuntu/phase2
-            docker compose down || true
-            docker compose build
-            docker compose up -d
-            for i in {1..20}; do
-              if curl -fsS -m 2 http://localhost/ >/dev/null; then break; fi
-              sleep 2
-            done
-            curl -fsS http://localhost/ | head -n 1 || true
+            aws ecr get-login-password --region "${{ secrets.AWS_REGION }}" | sudo docker login --username AWS --password-stdin "${{ secrets.ECR_REPO%/*}}"
+            sudo docker compose pull
+            sudo docker compose up -d
+            sudo docker compose ps

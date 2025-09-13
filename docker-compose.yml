@@ -1,6 +1,6 @@
 services:
   web:
-    build: ./app
+    image: 903322079825.dkr.ecr.ap-southeast-2.amazonaws.com/terraform-docker-demo:latest
     container_name: tf-docker-demo
     ports:
       - "80:8080"
