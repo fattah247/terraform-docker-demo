@@ -9,6 +9,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,34 +25,61 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push image
+        env:
+          ECR_REPO: ${{ secrets.ECR_REPO }}  
         run: |
-          ECR="${{ secrets.ECR_REPO }}"
-          docker build -t "$ECR:latest" ./app
-          docker push "$ECR:latest"
+          docker build -t "$ECR_REPO:latest" ./app
+          docker push "$ECR_REPO:latest"
 
       - name: SSH pull & restart
         uses: appleboy/ssh-action@v0.1.7
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECR_REPO: ${{ secrets.ECR_REPO }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
+          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION,ECR_REPO,ECR_REGISTRY
           script: |
             set -euxo pipefail
+
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update
               sudo apt-get install -y ca-certificates curl gnupg
               sudo install -m 0755 -d /etc/apt/keyrings
               curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-              echo \
-                "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release; echo $VERSION_CODENAME) stable" \
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release; echo $VERSION_CODENAME) stable" \
                 | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
               sudo apt-get update
               sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
               sudo usermod -aG docker ubuntu || true
               sudo systemctl enable --now docker
             fi
+
+            if ! command -v aws >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y awscli
+            fi
+
+            aws ecr get-login-password --region "$AWS_REGION" \
+              | sudo docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+            sudo mkdir -p /home/ubuntu/phase2
             cd /home/ubuntu/phase2
-            aws ecr get-login-password --region "${{ secrets.AWS_REGION }}" | sudo docker login --username AWS --password-stdin "${{ secrets.ECR_REPO%/*}}"
+
+            cat > docker-compose.yml <<EOF
+            services:
+              web:
+                image: ${ECR_REPO}:latest
+                container_name: tf-docker-demo
+                ports:
+                  - "80:8080"
+                restart: always
+            EOF
+
             sudo docker compose pull
             sudo docker compose up -d
             sudo docker compose ps
