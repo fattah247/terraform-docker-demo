@@ -1,0 +1,34 @@
+name: Build and Push to ECR (:latest)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REPOSITORY: terraform-docker-demo
+
+jobs:
+  build-and-push:
+    permissions:
+      id-token: write
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::903322079825:role/gha-ci-ecr-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+
+      - name: Build and Push :latest (linux/amd64)
+        env:
+          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+        run: |
+          docker build --platform linux/amd64 -t "$IMAGE:latest" .
+          docker push "$IMAGE:latest"
